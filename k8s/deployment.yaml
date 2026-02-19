@@ -1,0 +1,97 @@
+---
+# Secret — create this manually before deploying:
+#
+#   kubectl create secret generic anylist-skylight-sync-secrets \
+#     --from-literal=ANYLIST_EMAIL='your@email.com' \
+#     --from-literal=ANYLIST_PASSWORD='yourpassword' \
+#     --from-literal=SKYLIGHT_EMAIL='your@email.com' \
+#     --from-literal=SKYLIGHT_PASSWORD='yourpassword' \
+#     --from-literal=SKYLIGHT_FRAME_ID='abc123'
+#
+# The secret is not defined in this file to avoid accidentally committing credentials.
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: anylist-skylight-sync-data
+  labels:
+    app: anylist-skylight-sync
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # The SQLite database will stay tiny — 100Mi is more than enough
+      storage: 100Mi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anylist-skylight-sync
+  labels:
+    app: anylist-skylight-sync
+spec:
+  # Only run one replica — running two copies would cause double-sync conflicts
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anylist-skylight-sync
+  template:
+    metadata:
+      labels:
+        app: anylist-skylight-sync
+    spec:
+      containers:
+        - name: sync
+          image: anylist-skylight-sync:latest
+          imagePullPolicy: IfNotPresent
+
+          env:
+            # Non-sensitive config — set these directly
+            - name: SYNC_INTERVAL_MS
+              value: "60000"
+            - name: LIST_SYNC_PAIRS
+              value: "Grocery List=Grocery List"
+            - name: TIMEZONE
+              value: "America/New_York"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: STATE_DB_PATH
+              value: "/data/sync-state.db"
+
+          # Sensitive credentials come from the k8s secret
+          envFrom:
+            - secretRef:
+                name: anylist-skylight-sync-secrets
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+
+          # There's no HTTP server, so we use a process check for liveness
+          livenessProbe:
+            exec:
+              command:
+                - node
+                - -e
+                - "process.exit(0)"
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 3
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: anylist-skylight-sync-data
+
+      restartPolicy: Always

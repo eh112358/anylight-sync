@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  sync:
+    build: .
+    # For local dev, mount src/ so you can rebuild quickly without rebuilding the image
+    # Use 'npm run dev' instead of 'node dist/index.js' for hot reload
+    env_file:
+      - .env
+    volumes:
+      # SQLite state database — persists between restarts
+      - sync-data:/data
+    restart: unless-stopped
+
+volumes:
+  sync-data:

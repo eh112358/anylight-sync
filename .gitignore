@@ -1,0 +1,17 @@
+# Secrets — never commit these
+.env
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# SQLite state database
+*.db
+
+# Claude Code editor files
+.claude/
+
+# In-progress planning notes (not project code)
+in-progress/
