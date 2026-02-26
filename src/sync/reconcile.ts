@@ -1,19 +1,21 @@
 // Startup reconciliation.
 //
-// This runs once when the service starts (including after a crash).
-// It compares the live state from both platforms against the last known SQLite
-// state, and resolves any drift — with AnyList winning all conflicts.
+// Runs once when the service starts. It compares the live state from both
+// platforms against our SQLite state and resolves any drift — AnyList wins all conflicts.
 //
-// The key challenge on a fresh start with an empty state DB: both platforms
-// may already have the same items. We must NOT duplicate them. So we first
-// match up existing items by label, record those pairings in state, and only
-// create/delete items that are genuinely missing from one side.
+// The key challenge on a fresh start (empty state DB): both platforms may already
+// have the same items. We must NOT duplicate them. So we:
+//   Pass 1 — Match existing items by label and record pairings in state
+//   Pass 2 — Delete Skylight items with no AnyList counterpart
+//
+// This must call refreshLists() to get current AnyList data, since connect()
+// only does an initial load.
 
 import type { AnyListClient } from '../anylist/client.js';
 import type { ListSyncPair } from '../config.js';
 import type { SkylightClient } from '../skylight/client.js';
-import { findOrCreateSkylightList } from './lists.js';
 import { addItem, deleteItem, getListWithItems } from '../skylight/endpoints/lists.js';
+import { findOrCreateSkylightList } from './lists.js';
 import { logger } from '../utils/logger.js';
 import type { StateStore } from './state.js';
 
@@ -23,9 +25,12 @@ export async function reconcileOnStartup(
   state: StateStore,
   listSyncPairs: ListSyncPair[]
 ): Promise<Map<string, string>> {
-  logger.info('Starting up — reconciling state against live platforms');
+  logger.info('Starting reconciliation — aligning both platforms against current AnyList state');
 
-  // Maps anylist list name → skylight list ID (used by the main sync loop)
+  // Get fresh AnyList data before we start comparing anything
+  await anylistClient.refreshLists();
+
+  // Maps anylist list name → skylight list ID (returned for use in the main sync loop)
   const skylightListIds = new Map<string, string>();
 
   for (const pair of listSyncPairs) {
@@ -34,11 +39,10 @@ export async function reconcileOnStartup(
       skylightList: pair.skylightName,
     });
 
-    // Make sure the Skylight list exists (create it if not)
+    // Ensure the Skylight list exists (creates it if missing)
     const skylightListId = await findOrCreateSkylightList(skylightClient, pair.skylightName);
     skylightListIds.set(pair.anylistName, skylightListId);
 
-    // Get current live state from both platforms
     const anylistList = anylistClient.getListByName(pair.anylistName);
     if (!anylistList) {
       logger.warn('AnyList list not found during reconciliation — skipping', {
@@ -49,7 +53,7 @@ export async function reconcileOnStartup(
 
     const { items: skylightItems } = await getListWithItems(skylightClient, skylightListId);
 
-    // Find which items are already tracked in our state DB for this list
+    // Find which items are already tracked in state for this list
     const allStateItems = state.getAllListItems();
     const knownAnylistIds = new Set(
       allStateItems
@@ -62,19 +66,18 @@ export async function reconcileOnStartup(
         .map((r) => r.skylightItemId)
     );
 
-    // Build a label → Skylight item lookup for items not yet in our state.
-    // Used to match AnyList items to existing Skylight items instead of duplicating them.
+    // Build a label → Skylight item map for items not yet tracked in state.
+    // Used to match AnyList items to existing Skylight items by label.
     const unknownSkylightByLabel = new Map(
       skylightItems
         .filter((i) => !knownSkylightIds.has(i.id))
         .map((i) => [i.attributes.label.toLowerCase().trim(), i])
     );
 
-    // --- Pass 1: For each AnyList item, either match it to an existing Skylight item
-    //             or create a new one ---
+    // --- Pass 1: For each AnyList item, match to an existing Skylight item or create one ---
     for (const anylistItem of anylistList.items) {
       if (knownAnylistIds.has(anylistItem.identifier)) {
-        continue; // already tracked in state — nothing to do
+        continue; // already tracked — nothing to do
       }
 
       const label = anylistItem.quantity
@@ -84,7 +87,7 @@ export async function reconcileOnStartup(
       const matchedSkylightItem = unknownSkylightByLabel.get(label.toLowerCase().trim());
 
       if (matchedSkylightItem) {
-        // Same item already exists on both sides — record the pairing, don't duplicate
+        // Same item already exists on both sides — record the pairing, don't duplicate it
         logger.info('Matched existing item between AnyList and Skylight', { label });
         state.upsertListItem({
           anylistItemId: anylistItem.identifier,
@@ -98,8 +101,8 @@ export async function reconcileOnStartup(
         });
         unknownSkylightByLabel.delete(label.toLowerCase().trim());
       } else {
-        // Item exists in AnyList but not in Skylight — create it
-        logger.info('New item in AnyList — adding to Skylight during reconciliation', { label });
+        // Item only exists in AnyList — create it in Skylight
+        logger.info('Item in AnyList but not Skylight — creating in Skylight', { label });
         const skylightItem = await addItem(skylightClient, skylightListId, label);
         state.upsertListItem({
           anylistItemId: anylistItem.identifier,
@@ -114,13 +117,12 @@ export async function reconcileOnStartup(
       }
     }
 
-    // --- Pass 2: Delete any Skylight items that have no AnyList counterpart ---
-    // Anything still in unknownSkylightByLabel at this point was not matched
-    // to any AnyList item. Since AnyList is the source of truth, delete them.
+    // --- Pass 2: Remove Skylight items with no AnyList counterpart ---
+    // Anything still in unknownSkylightByLabel was not matched to an AnyList item.
+    // Since AnyList is the source of truth, remove them from Skylight.
     for (const [, skylightItem] of unknownSkylightByLabel) {
-      logger.info('Removing Skylight item with no AnyList counterpart', {
+      logger.info('Item in Skylight but not AnyList — removing from Skylight', {
         label: skylightItem.attributes.label,
-        skylightItemId: skylightItem.id,
       });
       try {
         await deleteItem(skylightClient, skylightListId, skylightItem.id);
@@ -132,10 +134,11 @@ export async function reconcileOnStartup(
       }
     }
 
-    logger.info('List reconciliation complete', { listName: pair.anylistName });
+    logger.info('List pair reconciliation complete', {
+      anylistList: pair.anylistName,
+      skylightList: pair.skylightName,
+    });
   }
-
-  // Meal plan sync is temporarily disabled
 
   logger.info('Startup reconciliation complete');
   return skylightListIds;

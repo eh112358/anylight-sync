@@ -5,24 +5,28 @@
 //   2. Open the SQLite state database
 //   3. Connect to AnyList (WebSocket)
 //   4. Log in to Skylight
-//   5. Reconcile: bring both platforms in sync using AnyList as source of truth
-//   6. Start listening for AnyList changes (WebSocket push)
-//   7. Start the Skylight polling loop
+//   5. Reconcile: align both platforms with AnyList as source of truth
+//   6. Register WebSocket listener (triggers an immediate poll when AnyList changes)
+//   7. Run the first poll cycle immediately
+//   8. Schedule recurring poll cycles every SYNC_INTERVAL_MS
 //
-// On shutdown (SIGINT or SIGTERM), cleanly disconnect before exiting.
+// How syncing works:
+//   Every poll cycle calls syncListPair() for each configured list pair.
+//   syncListPair() always starts by calling refreshLists() to get fresh AnyList
+//   data from the API — this is the critical step that makes AnyList changes
+//   visible without restarting the service.
+//
+//   The AnyList WebSocket, when it works, triggers an extra poll immediately
+//   when a change is detected. When it drops (frequently), the scheduled
+//   poll loop catches changes within SYNC_INTERVAL_MS.
 
 import { loadConfig } from './config.js';
 import { AnyListClient } from './anylist/client.js';
 import { SkylightClient } from './skylight/client.js';
 import { StateStore } from './sync/state.js';
 import { reconcileOnStartup } from './sync/reconcile.js';
-import { syncAnyListToSkylight, syncSkylightToAnyList } from './sync/lists.js';
+import { syncListPair } from './sync/lists.js';
 import { logger } from './utils/logger.js';
-
-// Debounce: if AnyList fires multiple list-update events in quick succession
-// (e.g. the user checks off several items), we wait this long before actually
-// running the sync — avoids hammering Skylight with one request per tap.
-const ANYLIST_DEBOUNCE_MS = 2000;
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -43,7 +47,7 @@ async function main(): Promise<void> {
   await skylightClient.login();
 
   // --- Startup reconciliation ---
-  // Returns a map of anylist list name → skylight list ID, which we reuse throughout
+  // Aligns both platforms. Returns a map of anylist list name → skylight list ID.
   const skylightListIds = await reconcileOnStartup(
     anylistClient,
     skylightClient,
@@ -51,100 +55,68 @@ async function main(): Promise<void> {
     config.listSyncPairs
   );
 
-  // --- AnyList WebSocket listener ---
-  // The anylist package fires 'lists-update' whenever any list changes.
-  // We debounce it to avoid rapid-fire syncs when many items change at once.
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  // --- Poll cycle ---
+  // Syncs all configured list pairs. Called on a schedule and also immediately
+  // when the AnyList WebSocket fires a change event.
+  //
+  // Guard flag prevents overlapping poll cycles if one takes longer than the interval.
+  let pollRunning = false;
 
-  anylistClient.onListsUpdate((updatedLists) => {
-    if (debounceTimer) clearTimeout(debounceTimer);
+  async function runPollCycle(): Promise<void> {
+    if (pollRunning) {
+      logger.debug('Poll cycle already running — skipping this trigger');
+      return;
+    }
+    pollRunning = true;
 
-    debounceTimer = setTimeout(async () => {
-      logger.info('AnyList change detected — running sync');
+    logger.info('Running poll cycle');
 
+    try {
       for (const pair of config.listSyncPairs) {
         const skylightListId = skylightListIds.get(pair.anylistName);
         if (!skylightListId) {
-          logger.warn('No Skylight list ID found for AnyList list — skipping', {
+          logger.warn('No Skylight list ID for pair — skipping', {
             anylistList: pair.anylistName,
           });
           continue;
         }
 
-        const updatedList = updatedLists.find((l) => l.name === pair.anylistName);
-        if (!updatedList) {
-          logger.debug('Updated list not in sync pairs — skipping', { pair });
-          continue;
-        }
-
         try {
-          await syncAnyListToSkylight(updatedList, skylightListId, skylightClient, state);
+          await syncListPair(pair, skylightListId, anylistClient, skylightClient, state);
         } catch (error) {
-          logger.error('Error syncing AnyList → Skylight', {
-            list: pair.anylistName,
+          logger.error('Error syncing list pair', {
+            anylistList: pair.anylistName,
             error: error instanceof Error ? error.message : String(error),
           });
         }
       }
-    }, ANYLIST_DEBOUNCE_MS);
-  });
-
-  // --- Skylight polling loop ---
-  // Polls both platforms every SYNC_INTERVAL_MS.
-  //
-  // This handles two things:
-  //   1. AnyList → Skylight: catches any AnyList changes that the WebSocket missed
-  //      (the WebSocket drops frequently due to timeouts, so polling is the reliable fallback)
-  //   2. Skylight → AnyList: the only way to detect changes made on the Skylight frame
-  async function runSkylightPoll(): Promise<void> {
-    logger.info('Running poll cycle');
-
-    for (const pair of config.listSyncPairs) {
-      const skylightListId = skylightListIds.get(pair.anylistName);
-      if (!skylightListId) continue;
-
-      const anylistList = anylistClient.getListByName(pair.anylistName);
-      if (!anylistList) {
-        logger.warn('AnyList list not found during poll — skipping', {
-          listName: pair.anylistName,
-        });
-        continue;
-      }
-
-      // AnyList → Skylight (catches changes missed by the WebSocket)
-      try {
-        await syncAnyListToSkylight(anylistList, skylightListId, skylightClient, state);
-      } catch (error) {
-        logger.error('Error syncing AnyList → Skylight during poll', {
-          list: pair.anylistName,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-
-      // Skylight → AnyList
-      try {
-        await syncSkylightToAnyList(
-          skylightListId,
-          pair.anylistName,
-          anylistList.identifier,
-          anylistClient,
-          skylightClient,
-          state
-        );
-      } catch (error) {
-        logger.error('Error syncing Skylight → AnyList', {
-          list: pair.anylistName,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+    } finally {
+      pollRunning = false;
     }
-
-    // Meal plan sync is temporarily disabled — see meals.ts for details
   }
 
-  // Run the first poll immediately, then schedule recurring polls
-  await runSkylightPoll();
-  const pollInterval = setInterval(runSkylightPoll, config.syncIntervalMs);
+  // --- AnyList WebSocket listener ---
+  // When the WebSocket fires a change event, trigger an immediate poll.
+  // The poll cycle calls refreshLists() itself, so we don't use the event
+  // data directly — it could be incomplete if the WebSocket partially dropped.
+  anylistClient.onListsUpdate(() => {
+    logger.info('AnyList WebSocket change detected — triggering immediate poll');
+    runPollCycle().catch((error) => {
+      logger.error('Error in WebSocket-triggered poll cycle', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  });
+
+  // Run the first poll cycle immediately after reconciliation, then on schedule
+  await runPollCycle();
+  const pollInterval = setInterval(() => {
+    runPollCycle().catch((error) => {
+      logger.error('Error in scheduled poll cycle', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, config.syncIntervalMs);
 
   logger.info('Sync service is running', {
     pollIntervalMs: config.syncIntervalMs,
@@ -155,9 +127,7 @@ async function main(): Promise<void> {
   function shutdown(signal: string): void {
     logger.info(`Received ${signal} — shutting down gracefully`);
 
-    if (debounceTimer) clearTimeout(debounceTimer);
     clearInterval(pollInterval);
-
     anylistClient.disconnect();
     state.close();
 
@@ -168,11 +138,13 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  // Log unhandled errors rather than crashing silently
+  // Crash the process on unhandled errors so Kubernetes restarts the pod.
+  // A pod restart is safer than silently continuing in an unknown state.
   process.on('unhandledRejection', (reason) => {
-    logger.error('Unhandled promise rejection — this is a bug, please report it', {
+    logger.error('Unhandled promise rejection — restarting', {
       reason: reason instanceof Error ? reason.message : String(reason),
     });
+    process.exit(1);
   });
 }
 

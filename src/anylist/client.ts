@@ -43,6 +43,15 @@ export class AnyListClient {
     });
   }
 
+  // Forces a fresh fetch of all list data from the AnyList API, bypassing the
+  // in-memory cache. Must be called at the start of every poll cycle — without
+  // this, getListByName() returns stale data from when the service started.
+  async refreshLists(): Promise<void> {
+    this.assertConnected();
+    await this.client.getLists(true);
+    logger.debug('AnyList lists refreshed from API');
+  }
+
   // Must be called before the process exits to cleanly close the WebSocket.
   disconnect(): void {
     if (this.client && this.connected) {
